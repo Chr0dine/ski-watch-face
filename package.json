@@ -1,0 +1,20 @@
+{
+  "name": "ski-watch",
+  "author": "you",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Ski Watch",
+    "uuid": "6f1c2b8e-3d4a-4e5f-9a7b-1c2d3e4f5a6b",
+    "projectType": "native",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "watchapp": { "watchface": true },
+    "targetPlatforms": ["basalt"],
+    "capabilities": ["location"],
+    "messageKeys": ["TEMPERATURE", "CONDITIONS", "SNOWFALL"],
+    "resources": { "media": [] }
+  }
+}
