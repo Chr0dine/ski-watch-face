@@ -17,6 +17,9 @@ current weather and how much snow is forecast for the week ahead.
   snow expected over the next seven days, in inches (e.g. `4.2"`).
 - **Status messages**: if weather can't be loaded, the weather area shows why,
   e.g. `Phone not connected`, `No network`, `Timeout` or `Fetching...`.
+- **Resilient weather**: failed requests (e.g. a temporary HTTP 503) are
+  retried automatically, and the last good weather is cached on the phone and
+  kept on screen, so a brief outage doesn't replace the forecast with an error.
 
 ## How it works
 
@@ -31,6 +34,19 @@ The face has two halves:
   fetches data from the free [Open-Meteo](https://open-meteo.com/) API (no API
   key needed). It sends the watch the current temperature, a condition label,
   and the sum of the 7-day `snowfall_sum` forecast.
+
+### Error handling & caching
+
+- A failed weather request is retried up to 3 times, after 5 s, 20 s and 60 s.
+- Each successful result is saved to the phone's `localStorage`. On the next
+  refresh, cached weather (if less than 6 hours old) is sent to the watch
+  immediately while fresh data loads.
+- If every retry fails, the phone re-sends the cached weather; an error
+  message is shown only when there is no recent cache.
+- Only one refresh runs at a time, so overlapping watch requests don't stack
+  up duplicate fetches.
+- On the watch, once real weather has been displayed, later status/error text
+  from the phone is ignored and the last weather stays on screen.
 
 If the phone can't provide a location, the face falls back to a default
 location (Denver, CO). To use your home mountain instead, change
@@ -65,7 +81,7 @@ drawing uses fixed coordinates for that screen size.
 
 ```
 src/c/ski-watch-face.c   Watch-side drawing, time, battery, AppMessage handling
-src/pkjs/index.js        Phone-side location + Open-Meteo weather fetch
+src/pkjs/index.js        Phone-side location, Open-Meteo fetch, retries + cache
 package.json             App metadata (UUID, platforms, message keys)
 wscript                  Pebble build rules
 ```

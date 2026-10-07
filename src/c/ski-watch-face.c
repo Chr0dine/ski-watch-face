@@ -230,8 +230,9 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
     s_have_weather = true;
     snprintf(s_weather, sizeof(s_weather), "%d°F\n%s",
              (int)temp->value->int32, cond->value->cstring);
-  } else if (cond) {
-    // Status / error text from the phone (e.g. "No GPS")
+  } else if (cond && !s_have_weather) {
+    // Status / error text from the phone. Once real weather has been shown,
+    // keep it on screen instead of replacing it with an error.
     snprintf(s_weather, sizeof(s_weather), "%s", cond->value->cstring);
   }
   if (snow) {
