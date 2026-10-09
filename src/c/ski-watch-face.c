@@ -1,16 +1,24 @@
 #include <pebble.h>
+#include <stdlib.h>
 
 static Window *s_window;
 static Layer *s_canvas;
 
 static char s_time[8] = "12:00";
 static char s_date[16] = "";
-static char s_weather[32] = "Waiting\nfor phone";
+static char s_temp[8] = "--";
+static char s_status[32] = "Waiting for phone";   // shown only until weather arrives
 static bool s_have_weather = false;
 static AppTimer *s_retry_timer = NULL;
 static char s_snow[16] = "--";
 static char s_batt[8] = "";
 static BatteryChargeState s_charge;
+
+// What the sky should look like
+typedef enum {
+  SKY_CLEAR, SKY_PARTLY, SKY_OVERCAST, SKY_FOG, SKY_RAIN, SKY_SNOW, SKY_STORM
+} SkyType;
+static SkyType s_sky = SKY_CLEAR;
 
 // ---------- Path data (must live at file scope) ----------
 
@@ -34,6 +42,11 @@ static GPathInfo s_slope_info = { .num_points = 4, .points = s_slope_pts };
 static GPoint s_torso_pts[] = {{64, 112}, {90, 112}, {94, 88}, {70, 82}};
 static GPathInfo s_torso_info = { .num_points = 4, .points = s_torso_pts };
 
+// Lightning bolt for storms
+static GPoint s_bolt_pts[] = {{100, 2}, {92, 14}, {97, 14}, {93, 25}, {105, 10},
+                              {99, 10}, {103, 2}};
+static GPathInfo s_bolt_info = { .num_points = 7, .points = s_bolt_pts };
+
 // ---------- Drawing helpers ----------
 
 static void draw_text_shadowed(GContext *ctx, const char *text, GFont font,
@@ -54,7 +67,14 @@ static void draw_line(GContext *ctx, int x1, int y1, int x2, int y2,
   graphics_draw_line(ctx, GPoint(x1, y1), GPoint(x2, y2));
 }
 
-// Six-armed snowflake with a small shadow so it reads on the blue sky
+static void fill_path(GContext *ctx, GPathInfo *info, GColor color) {
+  GPath *path = gpath_create(info);
+  graphics_context_set_fill_color(ctx, color);
+  gpath_draw_filled(ctx, path);
+  gpath_destroy(path);
+}
+
+// Six-armed snowflake with a small shadow so it reads on the sky
 static void draw_snowflake(GContext *ctx, int cx, int cy) {
   static const int8_t arms[3][2] = {{8, 0}, {4, 7}, {-4, 7}};
   for (int pass = 0; pass < 2; pass++) {
@@ -69,29 +89,142 @@ static void draw_snowflake(GContext *ctx, int cx, int cy) {
   }
 }
 
-// Small black battery icon (18x9 body + nub) with a fill level
+// Battery icon (18x9 body + nub): white outline with a shadow, colored fill level
 static void draw_battery(GContext *ctx, int x, int y) {
   int pct = s_charge.charge_percent;
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_draw_rect(ctx, GRect(x, y, 18, 9));
-  graphics_context_set_fill_color(ctx, GColorBlack);
-  graphics_fill_rect(ctx, GRect(x + 18, y + 3, 2, 3), 0, GCornerNone);
+  for (int pass = 0; pass < 2; pass++) {
+    int off = (pass == 0) ? 1 : 0;
+    GColor color = (pass == 0) ? GColorBlack : GColorWhite;
+    graphics_context_set_stroke_color(ctx, color);
+    graphics_context_set_stroke_width(ctx, 1);
+    graphics_draw_rect(ctx, GRect(x + off, y + off, 18, 9));
+    graphics_context_set_fill_color(ctx, color);
+    graphics_fill_rect(ctx, GRect(x + 18 + off, y + 3 + off, 2, 3), 0, GCornerNone);
+  }
+  GColor level = s_charge.is_charging ? GColorYellow
+               : (pct <= 10 ? GColorRed : (pct <= 30 ? GColorOrange : GColorGreen));
+  graphics_context_set_fill_color(ctx, level);
   graphics_fill_rect(ctx, GRect(x + 2, y + 2, (14 * pct) / 100, 5), 0, GCornerNone);
 }
 
-static void fill_path(GContext *ctx, GPathInfo *info, GColor color) {
-  GPath *path = gpath_create(info);
-  graphics_context_set_fill_color(ctx, color);
-  gpath_draw_filled(ctx, path);
-  gpath_destroy(path);
+// ---------- Sky ----------
+
+static SkyType sky_from_wmo(int code) {
+  if (code <= 1) return SKY_CLEAR;
+  if (code == 2) return SKY_PARTLY;
+  if (code == 3) return SKY_OVERCAST;
+  if (code == 45 || code == 48) return SKY_FOG;
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return SKY_RAIN;
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return SKY_SNOW;
+  if (code >= 95) return SKY_STORM;
+  return SKY_CLEAR;
 }
+
+static GColor sky_color(void) {
+  switch (s_sky) {
+    case SKY_OVERCAST:
+    case SKY_FOG:
+    case SKY_SNOW:  return GColorLightGray;
+    case SKY_RAIN:  return GColorDarkGray;
+    case SKY_STORM: return GColorOxfordBlue;
+    default:        return GColorVividCerulean;
+  }
+}
+
+// Mountains get darker under a pale sky so they stay visible
+static GColor mountain_color(void) {
+  switch (s_sky) {
+    case SKY_OVERCAST:
+    case SKY_FOG:
+    case SKY_SNOW:  return GColorDarkGray;
+    default:        return GColorLightGray;
+  }
+}
+
+static void draw_sun(GContext *ctx, int cx, int cy) {
+  static const int8_t rays[8][4] = {
+    {8, 0, 11, 0}, {-8, 0, -11, 0}, {0, -8, 0, -11}, {0, 8, 0, 11},
+    {6, 6, 8, 8}, {-6, 6, -8, 8}, {6, -6, 8, -8}, {-6, -6, -8, -8}
+  };
+  for (int i = 0; i < 8; i++) {
+    draw_line(ctx, cx + rays[i][0], cy + rays[i][1],
+              cx + rays[i][2], cy + rays[i][3], GColorYellow, 2);
+  }
+  graphics_context_set_fill_color(ctx, GColorYellow);
+  graphics_fill_circle(ctx, GPoint(cx, cy), 6);
+}
+
+static void draw_cloud(GContext *ctx, int x, int y, GColor color) {
+  graphics_context_set_fill_color(ctx, color);
+  graphics_fill_circle(ctx, GPoint(x + 7, y + 8), 6);
+  graphics_fill_circle(ctx, GPoint(x + 15, y + 5), 7);
+  graphics_fill_circle(ctx, GPoint(x + 23, y + 8), 6);
+  graphics_fill_rect(ctx, GRect(x + 7, y + 8, 17, 6), 0, GCornerNone);
+}
+
+static void draw_sky(GContext *ctx, GRect b) {
+  graphics_context_set_fill_color(ctx, sky_color());
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
+
+  switch (s_sky) {
+    case SKY_CLEAR:
+      draw_sun(ctx, 92, 12);
+      break;
+    case SKY_PARTLY:
+      draw_sun(ctx, 104, 10);
+      draw_cloud(ctx, 68, 8, GColorWhite);
+      break;
+    case SKY_OVERCAST:
+      draw_cloud(ctx, 66, 4, GColorWhite);
+      draw_cloud(ctx, -4, 40, GColorWhite);
+      draw_cloud(ctx, 118, 38, GColorWhite);
+      break;
+    case SKY_RAIN:
+      draw_cloud(ctx, 66, 4, GColorLightGray);
+      draw_cloud(ctx, -4, 40, GColorLightGray);
+      draw_cloud(ctx, 118, 38, GColorLightGray);
+      for (int i = 0; i < 14; i++) {
+        int x = (i * 13 + 7) % 144;
+        int y = (i * 29) % 80 + 14;
+        draw_line(ctx, x, y, x - 3, y + 7, GColorPictonBlue, 1);
+      }
+      break;
+    case SKY_SNOW:
+      for (int i = 0; i < 16; i++) {
+        int x = (i * 19 + 5) % 144;
+        int y = (i * 31) % 90 + 6;
+        graphics_context_set_fill_color(ctx, GColorWhite);
+        graphics_fill_circle(ctx, GPoint(x, y), (i % 3 == 0) ? 2 : 1);
+      }
+      break;
+    case SKY_STORM:
+      draw_cloud(ctx, 66, 4, GColorDarkGray);
+      draw_cloud(ctx, -4, 40, GColorDarkGray);
+      draw_cloud(ctx, 118, 38, GColorDarkGray);
+      fill_path(ctx, &s_bolt_info, GColorYellow);
+      break;
+    case SKY_FOG:
+      break;   // haze is drawn over the mountains in draw_skier()
+  }
+}
+
+// ---------- Skier ----------
 
 static void draw_skier(GContext *ctx) {
   // Mountains, snow caps, then all-white ground
-  fill_path(ctx, &s_mtn_info, GColorLightGray);
+  fill_path(ctx, &s_mtn_info, mountain_color());
   fill_path(ctx, &s_cap1_info, GColorWhite);
   fill_path(ctx, &s_cap2_info, GColorWhite);
   fill_path(ctx, &s_cap3_info, GColorWhite);
+
+  // Fog: pale bands across the mountains
+  if (s_sky == SKY_FOG) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_rect(ctx, GRect(0, 84, 120, 3), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(24, 96, 120, 4), 0, GCornerNone);
+    graphics_fill_rect(ctx, GRect(0, 108, 100, 3), 0, GCornerNone);
+  }
+
   fill_path(ctx, &s_slope_info, GColorWhite);
 
   // Poles (tips touch the snow)
@@ -122,13 +255,47 @@ static void draw_skier(GContext *ctx) {
   graphics_draw_circle(ctx, GPoint(106, 101), 4);
   graphics_draw_circle(ctx, GPoint(54, 101), 4);
 
-  // Head, helmet and goggles
+  // Head and hat with a pom on top (no goggles)
   graphics_context_set_fill_color(ctx, GColorMelon);
   graphics_fill_circle(ctx, GPoint(88, 77), 7);
   graphics_context_set_fill_color(ctx, GColorBlack);
   graphics_fill_rect(ctx, GRect(81, 69, 14, 5), 2, GCornersTop);
-  graphics_context_set_fill_color(ctx, GColorOrange);
-  graphics_fill_rect(ctx, GRect(88, 75, 7, 3), 1, GCornersAll);
+  graphics_context_set_fill_color(ctx, GColorRed);
+  graphics_fill_circle(ctx, GPoint(88, 66), 3);
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_stroke_width(ctx, 1);
+  graphics_draw_circle(ctx, GPoint(88, 66), 3);
+}
+
+// ---------- Bottom row: temperature + date, centered together ----------
+
+static void draw_bottom_row(GContext *ctx, GRect b) {
+  GFont row_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  graphics_context_set_text_color(ctx, GColorBlack);
+
+  if (!s_have_weather) {
+    // Until weather arrives, show what the watch is waiting on
+    graphics_draw_text(ctx, s_status, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(0, 150, b.size.w, 18),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    return;
+  }
+
+  GRect probe = GRect(0, 0, b.size.w, 22);
+  GSize ts = graphics_text_layout_get_content_size(
+      s_temp, row_font, probe, GTextOverflowModeWordWrap, GTextAlignmentLeft);
+  GSize ds = graphics_text_layout_get_content_size(
+      s_date, row_font, probe, GTextOverflowModeWordWrap, GTextAlignmentLeft);
+
+  const int gap = 8;
+  const int nudge_left = 4;       // shift the pair left a little
+  int x0 = (b.size.w - (ts.w + gap + ds.w)) / 2 - nudge_left;
+  if (x0 < 0) x0 = 0;
+
+  graphics_draw_text(ctx, s_temp, row_font, GRect(x0, 146, ts.w + 4, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  graphics_draw_text(ctx, s_date, row_font, GRect(x0 + ts.w + gap, 146, ds.w + 4, 22),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 }
 
 // ---------- Layer update ----------
@@ -136,42 +303,25 @@ static void draw_skier(GContext *ctx) {
 static void canvas_update(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
 
-  // Blue sky
-  graphics_context_set_fill_color(ctx, GColorVividCerulean);
-  graphics_fill_rect(ctx, b, 0, GCornerNone);
-
+  draw_sky(ctx, b);
   draw_skier(ctx);
 
   GFont small = fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
   GFont big = fonts_get_system_font(FONT_KEY_LECO_36_BOLD_NUMBERS);
-  GFont date_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 
-  // Weather: top left
-  draw_text_shadowed(ctx, s_weather, small, GRect(4, 2, 70, 36), GTextAlignmentLeft);
+  // Battery: top left, percentage to the right of the icon
+  draw_battery(ctx, 4, 5);
+  draw_text_shadowed(ctx, s_batt, small, GRect(27, 1, 40, 16), GTextAlignmentLeft);
+
   // Predicted weekly snowfall: snowflake icon with the total below, top right
   draw_snowflake(ctx, b.size.w - 14, 11);
   draw_text_shadowed(ctx, s_snow, small, GRect(70, 20, 70, 18), GTextAlignmentRight);
+
   // Time: middle
   draw_text_shadowed(ctx, s_time, big, GRect(0, 22, b.size.w, 44), GTextAlignmentCenter);
 
-  // Date: bottom, black, on the mountains
-  graphics_context_set_text_color(ctx, GColorBlack);
-  // Battery + date sit side by side as one group, centered on the screen
-  GSize ds = graphics_text_layout_get_content_size(
-      s_date, date_font, GRect(0, 0, b.size.w, 22),
-      GTextOverflowModeWordWrap, GTextAlignmentLeft);
-  const int batt_w = 28, gap = 6;
-  int x0 = (b.size.w - (ds.w + gap + batt_w)) / 2;
-  int bx = x0;                       // battery on the left
-  int dx = x0 + batt_w + gap;        // date to its right
-
-  graphics_draw_text(ctx, s_date, date_font, GRect(dx, 146, ds.w + 2, 22),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-
-  // Battery: black, icon over percent
-  draw_battery(ctx, bx + 4, 149);
-  graphics_draw_text(ctx, s_batt, small, GRect(bx, 155, batt_w, 14),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  // Temperature + date: bottom, black, on the snow
+  draw_bottom_row(ctx, b);
 }
 
 // ---------- Battery ----------
@@ -227,13 +377,14 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   Tuple *snow = dict_find(iter, MESSAGE_KEY_SNOWFALL);
 
   if (cond && temp) {
+    // With a temperature, CONDITIONS carries the numeric weather code (as text)
     s_have_weather = true;
-    snprintf(s_weather, sizeof(s_weather), "%d°F\n%s",
-             (int)temp->value->int32, cond->value->cstring);
+    snprintf(s_temp, sizeof(s_temp), "%d°", (int)temp->value->int32);
+    s_sky = sky_from_wmo(atoi(cond->value->cstring));
   } else if (cond && !s_have_weather) {
     // Status / error text from the phone. Once real weather has been shown,
     // keep it on screen instead of replacing it with an error.
-    snprintf(s_weather, sizeof(s_weather), "%s", cond->value->cstring);
+    snprintf(s_status, sizeof(s_status), "%s", cond->value->cstring);
   }
   if (snow) {
     int tenths = (int)snow->value->int32;
@@ -244,16 +395,16 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
 
 static void inbox_dropped(AppMessageResult reason, void *ctx) {
   if (s_have_weather) return;
-  snprintf(s_weather, sizeof(s_weather), "Msg dropped\n(%d)", (int)reason);
+  snprintf(s_status, sizeof(s_status), "Msg dropped (%d)", (int)reason);
   layer_mark_dirty(s_canvas);
 }
 
 static void outbox_failed(DictionaryIterator *iter, AppMessageResult reason, void *ctx) {
   if (s_have_weather) return;
   if (reason == APP_MSG_NOT_CONNECTED) {
-    snprintf(s_weather, sizeof(s_weather), "Phone not\nconnected");
+    snprintf(s_status, sizeof(s_status), "Phone not connected");
   } else {
-    snprintf(s_weather, sizeof(s_weather), "Send failed\n(%d)", (int)reason);
+    snprintf(s_status, sizeof(s_status), "Send failed (%d)", (int)reason);
   }
   layer_mark_dirty(s_canvas);
 }

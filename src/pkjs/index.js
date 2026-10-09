@@ -1,25 +1,21 @@
-// Phone-side code: fetches weather + 7-day snowfall from Open-Meteo (no API key needed).
-// Failed requests are retried, and the last good weather is kept so a temporary
+// Phone-side code: current weather from your location, 7-day snowfall for Park City,
+// both from Open-Meteo (no API key needed).
+// The watch turns the weather code into a sky. Failed requests are retried, and the last good weather is kept so a temporary
 // outage (like an HTTP 503) doesn't blank the watchface.
 
 // Used only if the phone can't give a location. Change to your home mountain / city.
 var DEFAULT_LAT = 39.7392;   // Denver
 var DEFAULT_LON = -104.9903;
 
+// The snow forecast always comes from Park City Mountain (not your current location).
+// Coordinates are approximate; ELEVATION (meters) makes the forecast match the mountain
+// rather than the valley (~2500 m is mid-mountain). Edit these to change the resort.
+var SNOW_LAT = 40.6514;
+var SNOW_LON = -111.5080;
+var SNOW_ELEVATION = 2500;
+
 var RETRY_DELAYS = [5000, 20000, 60000];       // ms between attempts after a failure
 var CACHE_MAX_AGE = 6 * 60 * 60 * 1000;        // ignore cached weather older than 6 hours
-
-var CONDITIONS = {   // kept short so they fit on the watch
-  0: 'Clear', 1: 'Fair', 2: 'P.Cloudy', 3: 'Overcast',
-  45: 'Fog', 48: 'Fog',
-  51: 'Drizzle', 53: 'Drizzle', 55: 'Drizzle',
-  61: 'Rain', 63: 'Rain', 65: 'Hvy rain',
-  66: 'Ice rain', 67: 'Ice rain',
-  71: 'Snow', 73: 'Snow', 75: 'Hvy snow', 77: 'Snow',
-  80: 'Showers', 81: 'Showers', 82: 'Hvy rain',
-  85: 'Snow', 86: 'Hvy snow',
-  95: 'Storm', 96: 'Storm', 99: 'Storm'
-};
 
 var inFlight = false;
 
@@ -83,11 +79,17 @@ function xhrGet(url, onOk, onFail) {
 }
 
 function fetchWeather(lat, lon, attempt) {
-  var url = 'https://api.open-meteo.com/v1/forecast' +
+  // Current temperature + sky: from wherever you are
+  var currentUrl = 'https://api.open-meteo.com/v1/forecast' +
     '?latitude=' + lat + '&longitude=' + lon +
     '&current=temperature_2m,weather_code' +
-    '&daily=snowfall_sum' +
-    '&temperature_unit=fahrenheit&precipitation_unit=inch' +
+    '&temperature_unit=fahrenheit&timezone=auto';
+
+  // 7-day snowfall: always for Park City, in inches
+  var snowUrl = 'https://api.open-meteo.com/v1/forecast' +
+    '?latitude=' + SNOW_LAT + '&longitude=' + SNOW_LON +
+    '&elevation=' + SNOW_ELEVATION +
+    '&daily=snowfall_sum&precipitation_unit=inch' +
     '&forecast_days=7&timezone=auto';
 
   function fail(msg) {
@@ -102,21 +104,25 @@ function fetchWeather(lat, lon, attempt) {
     if (cached) { sendWeather(cached); } else { sendStatus(msg); }
   }
 
-  xhrGet(url, function (json) {
-    if (!json.current || !json.daily) { fail('Bad data'); return; }
+  xhrGet(currentUrl, function (cur) {
+    if (!cur.current) { fail('Bad data'); return; }
 
-    var total = 0;
-    var days = json.daily.snowfall_sum || [];
-    for (var i = 0; i < days.length; i++) { total += days[i] || 0; }
+    xhrGet(snowUrl, function (snow) {
+      if (!snow.daily) { fail('Bad data'); return; }
 
-    var w = {
-      temp: Math.round(json.current.temperature_2m),
-      cond: CONDITIONS[json.current.weather_code] || 'Unknown',
-      snow: Math.round(total * 10)
-    };
-    inFlight = false;
-    saveCache(w);
-    sendWeather(w);
+      var total = 0;
+      var days = snow.daily.snowfall_sum || [];
+      for (var i = 0; i < days.length; i++) { total += days[i] || 0; }
+
+      var w = {
+        temp: Math.round(cur.current.temperature_2m),
+        cond: String(cur.current.weather_code),   // WMO code; the watch draws the sky from it
+        snow: Math.round(total * 10)              // tenths of an inch
+      };
+      inFlight = false;
+      saveCache(w);
+      sendWeather(w);
+    }, fail);
   }, fail);
 }
 
