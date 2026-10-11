@@ -27,11 +27,17 @@ function sendStatus(msg) {
 }
 
 function sendWeather(w) {
-  Pebble.sendAppMessage({
+  var msg = {
     'TEMPERATURE': w.temp,
     'CONDITIONS': w.cond,
     'SNOWFALL': w.snow            // tenths of an inch
-  }, function () {
+  };
+  // Sunrise/sunset as minutes after local midnight (missing in older caches / polar regions)
+  if (w.sunrise != null && w.sunset != null) {
+    msg.SUNRISE = w.sunrise;
+    msg.SUNSET = w.sunset;
+  }
+  Pebble.sendAppMessage(msg, function () {
     console.log('Sent weather to watch');
   }, function () {
     console.log('Send to watch failed');
@@ -61,6 +67,12 @@ function saveCache(w) {
 
 // ---------- Fetching ----------
 
+// "2026-10-10T07:12" -> 432 (minutes after midnight), or null
+function minutesOfDay(iso) {
+  var m = /T(\d{2}):(\d{2})/.exec(iso || '');
+  return m ? parseInt(m[1], 10) * 60 + parseInt(m[2], 10) : null;
+}
+
 function xhrGet(url, onOk, onFail) {
   var req = new XMLHttpRequest();
   req.open('GET', url);
@@ -79,10 +91,11 @@ function xhrGet(url, onOk, onFail) {
 }
 
 function fetchWeather(lat, lon, attempt) {
-  // Current temperature + sky: from wherever you are
+  // Current temperature + sky, and today's sunrise/sunset: from wherever you are
   var currentUrl = 'https://api.open-meteo.com/v1/forecast' +
     '?latitude=' + lat + '&longitude=' + lon +
     '&current=temperature_2m,weather_code' +
+    '&daily=sunrise,sunset&forecast_days=1' +
     '&temperature_unit=fahrenheit&timezone=auto';
 
   // 7-day snowfall: always for Park City, in inches
@@ -117,7 +130,9 @@ function fetchWeather(lat, lon, attempt) {
       var w = {
         temp: Math.round(cur.current.temperature_2m),
         cond: String(cur.current.weather_code),   // WMO code; the watch draws the sky from it
-        snow: Math.round(total * 10)              // tenths of an inch
+        snow: Math.round(total * 10),             // tenths of an inch
+        sunrise: cur.daily && cur.daily.sunrise ? minutesOfDay(cur.daily.sunrise[0]) : null,
+        sunset: cur.daily && cur.daily.sunset ? minutesOfDay(cur.daily.sunset[0]) : null
       };
       inFlight = false;
       saveCache(w);

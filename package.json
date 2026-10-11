@@ -14,7 +14,7 @@
     "watchapp": { "watchface": true },
     "targetPlatforms": ["basalt"],
     "capabilities": ["location"],
-    "messageKeys": ["TEMPERATURE", "CONDITIONS", "SNOWFALL"],
+    "messageKeys": ["TEMPERATURE", "CONDITIONS", "SNOWFALL", "SUNRISE", "SUNSET"],
     "resources": { "media": [] }
   }
 }

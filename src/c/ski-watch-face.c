@@ -20,6 +20,13 @@ typedef enum {
 } SkyType;
 static SkyType s_sky = SKY_CLEAR;
 
+// Sunrise/sunset in minutes after local midnight (sent by the phone, saved across restarts)
+#define PERSIST_SUNRISE 1
+#define PERSIST_SUNSET  2
+static int s_sunrise = 7 * 60;
+static int s_sunset = 19 * 60;
+static bool s_night = false;
+
 // ---------- Path data (must live at file scope) ----------
 
 // Tall mountain range, filled down to the bottom of the screen
@@ -120,7 +127,24 @@ static SkyType sky_from_wmo(int code) {
   return SKY_CLEAR;
 }
 
+static bool is_night_now(void) {
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  int mins = t->tm_hour * 60 + t->tm_min;
+  return mins < s_sunrise || mins >= s_sunset;
+}
+
 static GColor sky_color(void) {
+  if (s_night) {
+    switch (s_sky) {
+      case SKY_CLEAR:
+      case SKY_PARTLY: return GColorOxfordBlue;
+      case SKY_OVERCAST:
+      case SKY_FOG:
+      case SKY_SNOW:   return GColorDarkGray;
+      default:         return GColorBlack;   // rain, storm
+    }
+  }
   switch (s_sky) {
     case SKY_OVERCAST:
     case SKY_FOG:
@@ -133,6 +157,14 @@ static GColor sky_color(void) {
 
 // Mountains get darker under a pale sky so they stay visible
 static GColor mountain_color(void) {
+  if (s_night) {
+    switch (s_sky) {
+      case SKY_OVERCAST:
+      case SKY_FOG:
+      case SKY_SNOW:  return GColorBlack;
+      default:        return GColorDarkGray;
+    }
+  }
   switch (s_sky) {
     case SKY_OVERCAST:
     case SKY_FOG:
@@ -154,6 +186,35 @@ static void draw_sun(GContext *ctx, int cx, int cy) {
   graphics_fill_circle(ctx, GPoint(cx, cy), 6);
 }
 
+// Crescent moon: a pale disc with a sky-colored disc cut out of it
+static void draw_moon(GContext *ctx, int cx, int cy) {
+  graphics_context_set_fill_color(ctx, GColorPastelYellow);
+  graphics_fill_circle(ctx, GPoint(cx, cy), 8);
+  graphics_context_set_fill_color(ctx, sky_color());
+  graphics_fill_circle(ctx, GPoint(cx + 5, cy - 3), 7);
+}
+
+static void draw_stars(GContext *ctx) {
+  static const int8_t stars[][2] = {
+    {8, 24}, {30, 50}, {52, 14}, {70, 6}, {112, 46}, {136, 54},
+    {18, 64}, {60, 70}, {100, 30}, {126, 74}, {44, 32}, {84, 52}
+  };
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  for (unsigned i = 0; i < ARRAY_LENGTH(stars); i++) {
+    if (i % 4 == 0) {
+      graphics_fill_circle(ctx, GPoint(stars[i][0], stars[i][1]), 1);
+    } else {
+      graphics_fill_rect(ctx, GRect(stars[i][0], stars[i][1], 1, 1), 0, GCornerNone);
+    }
+  }
+}
+
+// Sun by day, moon by night
+static void draw_sun_or_moon(GContext *ctx, int cx, int cy) {
+  if (s_night) draw_moon(ctx, cx, cy);
+  else draw_sun(ctx, cx, cy);
+}
+
 static void draw_cloud(GContext *ctx, int x, int y, GColor color) {
   graphics_context_set_fill_color(ctx, color);
   graphics_fill_circle(ctx, GPoint(x + 7, y + 8), 6);
@@ -166,23 +227,29 @@ static void draw_sky(GContext *ctx, GRect b) {
   graphics_context_set_fill_color(ctx, sky_color());
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
+  // Clouds are dimmer at night
+  GColor cloud = s_night ? GColorLightGray : GColorWhite;
+  GColor rain_cloud = s_night ? GColorDarkGray : GColorLightGray;
+
   switch (s_sky) {
     case SKY_CLEAR:
-      draw_sun(ctx, 92, 12);
+      if (s_night) draw_stars(ctx);
+      draw_sun_or_moon(ctx, 92, 12);
       break;
     case SKY_PARTLY:
-      draw_sun(ctx, 104, 10);
-      draw_cloud(ctx, 68, 8, GColorWhite);
+      if (s_night) draw_stars(ctx);
+      draw_sun_or_moon(ctx, 104, 10);
+      draw_cloud(ctx, 68, 8, cloud);
       break;
     case SKY_OVERCAST:
-      draw_cloud(ctx, 66, 4, GColorWhite);
-      draw_cloud(ctx, -4, 40, GColorWhite);
-      draw_cloud(ctx, 118, 38, GColorWhite);
+      draw_cloud(ctx, 66, 4, cloud);
+      draw_cloud(ctx, -4, 40, cloud);
+      draw_cloud(ctx, 118, 38, cloud);
       break;
     case SKY_RAIN:
-      draw_cloud(ctx, 66, 4, GColorLightGray);
-      draw_cloud(ctx, -4, 40, GColorLightGray);
-      draw_cloud(ctx, 118, 38, GColorLightGray);
+      draw_cloud(ctx, 66, 4, rain_cloud);
+      draw_cloud(ctx, -4, 40, rain_cloud);
+      draw_cloud(ctx, 118, 38, rain_cloud);
       for (int i = 0; i < 14; i++) {
         int x = (i * 13 + 7) % 144;
         int y = (i * 29) % 80 + 14;
@@ -219,7 +286,7 @@ static void draw_skier(GContext *ctx) {
 
   // Fog: pale bands across the mountains
   if (s_sky == SKY_FOG) {
-    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_context_set_fill_color(ctx, s_night ? GColorLightGray : GColorWhite);
     graphics_fill_rect(ctx, GRect(0, 84, 120, 3), 0, GCornerNone);
     graphics_fill_rect(ctx, GRect(24, 96, 120, 4), 0, GCornerNone);
     graphics_fill_rect(ctx, GRect(0, 108, 100, 3), 0, GCornerNone);
@@ -345,6 +412,7 @@ static void update_time(void) {
   char wday_month[12];
   strftime(wday_month, sizeof(wday_month), "%a %b", t);
   snprintf(s_date, sizeof(s_date), "%s %d", wday_month, t->tm_mday);
+  s_night = is_night_now();
   layer_mark_dirty(s_canvas);
 }
 
@@ -375,6 +443,8 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   Tuple *temp = dict_find(iter, MESSAGE_KEY_TEMPERATURE);
   Tuple *cond = dict_find(iter, MESSAGE_KEY_CONDITIONS);
   Tuple *snow = dict_find(iter, MESSAGE_KEY_SNOWFALL);
+  Tuple *rise = dict_find(iter, MESSAGE_KEY_SUNRISE);
+  Tuple *set = dict_find(iter, MESSAGE_KEY_SUNSET);
 
   if (cond && temp) {
     // With a temperature, CONDITIONS carries the numeric weather code (as text)
@@ -389,6 +459,13 @@ static void inbox_received(DictionaryIterator *iter, void *ctx) {
   if (snow) {
     int tenths = (int)snow->value->int32;
     snprintf(s_snow, sizeof(s_snow), "%d.%d\"", tenths / 10, tenths % 10);
+  }
+  if (rise && set) {
+    s_sunrise = (int)rise->value->int32;
+    s_sunset = (int)set->value->int32;
+    persist_write_int(PERSIST_SUNRISE, s_sunrise);
+    persist_write_int(PERSIST_SUNSET, s_sunset);
+    s_night = is_night_now();
   }
   layer_mark_dirty(s_canvas);
 }
@@ -424,6 +501,11 @@ static void window_unload(Window *w) {
 }
 
 static void init(void) {
+  if (persist_exists(PERSIST_SUNRISE) && persist_exists(PERSIST_SUNSET)) {
+    s_sunrise = persist_read_int(PERSIST_SUNRISE);
+    s_sunset = persist_read_int(PERSIST_SUNSET);
+  }
+
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers){
     .load = window_load, .unload = window_unload });
